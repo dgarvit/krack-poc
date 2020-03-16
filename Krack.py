@@ -6,6 +6,7 @@ import os, stat, socket, select, atexit
 
 ALL, DEBUG, INFO, STATUS, WARNING, ERROR = range(6)
 global_log_level = INFO
+HANDSHAKE_TRANSMIT_INTERVAL = 2
 COLORCODES = {
     "gray"  : "\033[0;37m",
     "green" : "\033[0;32m",
@@ -232,11 +233,72 @@ class DetectKRACK():
         self.sock_mon = MitmSocket(type=ETH_P_ALL, iface=self.nic_mon)
         self.sock_eth = L2Socket(type=ETH_P_ALL, iface=self.nic_iface)
 
+        """self.dhcp = DHCP_sock(sock=self.sock_eth,
+                        domain='krackattack.com',
+                        pool=Net('192.168.100.0/24'),
+                        network='192.168.100.0/24',
+                        gw='192.168.100.254',
+                        renewal_time=600, lease_time=3600)
+        # Configure gateway IP: reply to ARP and ping requests
+        subprocess.check_output(["ifconfig", self.nic_iface, "192.168.100.254"])
+
+        self.group_ip = self.dhcp.pool.pop()
+        self.group_arp = ARP_sock(sock=self.sock_eth, IP_addr=self.group_ip, ARP_addr=self.apmac)"""
+
+        log(STATUS, "Ready. Connect to this Access Point to start the tests.", color="green")
+
+        # Monitor both the normal interface and virtual monitor interface of the AP
+        self.next_arp = time.time() + 1
+        while True:
+            sel = select.select([self.sock_mon, self.sock_eth], [], [], 1)
+            if self.sock_mon in sel[0]:
+                self.handle_mon()
+            if self.sock_eth in sel[0]:
+                self.handle_eth()
+
+            # Periodically send the replayed broadcast ARP requests to test for group key reinstallations
+            """if time.time() > self.next_arp:
+                self.next_arp = time.time() + HANDSHAKE_TRANSMIT_INTERVAL
+                for client in self.clients.values():
+                    # Also keep injecting to PATCHED clients (just to be sure they keep rejecting replayed frames)
+                    if client.vuln_group != ClientState.VULNERABLE and client.mac in self.dhcp.leases:
+                        clientip = self.dhcp.leases[client.mac]
+                        client.groupkey_track_request()
+                        log(INFO, "%s: sending broadcast ARP to %s from %s" % (client.mac, clientip, self.group_ip))
+
+                        request = Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(op=1, hwsrc=self.apmac, psrc=self.group_ip, pdst=clientip)
+                        self.sock_eth.send(request)"""
+
+    def handle_mon (self):
+        p = self.sock_mon.recv()
+        if p == None: return
+        if p.type == 1: return
+
+        if (p.FCfield & 2) != 0:
+            clientmac, apmac = (p.addr1, p.addr2)
+        else:
+            clientmac, apmac = (p.addr2, p.addr1)
+
+        if apmac != self.apmac:
+            return None
+
+        elif p.addr1 == self.apmac and Dot11WEP in p:
+            if not clientmac in self.clients:
+
+
+    def handle_eth (self):
+        pass
+
     def stop(self):
         log(STATUS, "Closing hostapd and cleaning up ...")
         if self.hostapd:
             self.hostapd.terminate()
             self.hostapd.wait()
+        if self.sock_mon:
+            self.sock_mon.close()
+        if self.sock_eth:
+            self.sock_eth.close()
+
 
 
 def cleanup():
