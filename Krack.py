@@ -34,5 +34,31 @@ class DetectKRACK():
         self.hostapd_ctrl = None
         self.clients = dict()
 
+    def configure_interfaces(self):
+        log(STATUS, "Note: disable Wi-Fi in network manager & disable hardware encryption. Both may interfere with this script.")
+        subprocess.check_output(["rfkill", "unblock", "wifi"])
+        subprocess.call(["iw", self.nic_mon, "del"], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+        subprocess.check_output(["iw", self.nic_iface, "interface", "add", self.nic_mon, "type", "monitor"])
+        subprocess.check_output(["iw", self.nic_mon, "set", "type", "monitor"])
+        time.sleep(0.5)
+        subprocess.check_output(["iw", self.nic_mon, "set", "type", "monitor"])
+        subprocess.check_output(["ifconfig", self.nic_mon, "up"])
+
+    def run (self):
+        self.configure_interfaces()
+        log(STATUS, "Starting hostapd")
+        try:
+            print os.path.join(self.script_path, "hostapd/hostapd")
+            self.hostapd = subprocess.Popen([
+                os.path.join(self.script_path, "hostapd/hostapd"),
+                os.path.join(self.script_path, "hostapd/hostapd.conf")
+            ])
+        except:
+            if not os.path.exists("hostapd/hostapd"):
+                log(ERROR, "hostapd not found.")
+            raise
+
+
 if __name__ == '__main__':
     attack = DetectKRACK()
+    attack.run()
