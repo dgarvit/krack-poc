@@ -23,6 +23,7 @@ class ClientState():
         self.mac = clientmac
         self.TK = None
         self.vuln_4way = ClientState.UNKNOWN
+        self.vuln_group = ClientState.UNKNOWN   
 
         self.ivs = IvCollection()
         self.pairkey_sent_time_prev_iv = None
@@ -108,7 +109,7 @@ class ClientState():
 class DetectKRACK():
     def __init__ (self):
         self.script_path = os.path.dirname(os.path.realpath(__file__))
-        interface = "wlan0"  # Enter wifi interface here
+        interface = "wlo1"  # Enter wifi interface here
         self.nic_iface = interface
         self.nic_mon = interface + "mon"
         self.apmac = scapy.arch.get_if_hwaddr(interface)
@@ -153,6 +154,18 @@ class DetectKRACK():
         self.sock_mon = MitmSocket(type=ETH_P_ALL, iface=self.nic_mon)
         self.sock_eth = L2Socket(type=ETH_P_ALL, iface=self.nic_iface)
 
+        self.dhcp = DHCP_sock(sock=self.sock_eth,
+                        domain='krackattack.com',
+                        pool=Net('192.168.100.0/24'),
+                        network='192.168.100.0/24',
+                        gw='192.168.100.254',
+                        renewal_time=600, lease_time=3600)
+        # Configure gateway IP: reply to ARP and ping requests
+        subprocess.check_output(["ifconfig", self.nic_iface, "192.168.100.254"])
+
+        # Use a dedicated IP address for our broadcast ARP requests and replies
+        self.group_ip = self.dhcp.pool.pop()
+        self.group_arp = ARP_sock(sock=self.sock_eth, IP_addr=self.group_ip, ARP_addr=self.apmac)
         log(STATUS, "Ready. Connect to this Access Point to start the tests.", color="green")
 
         # Monitor both the normal interface and virtual monitor interface of the AP
@@ -163,6 +176,18 @@ class DetectKRACK():
                 self.handle_mon()
             if self.sock_eth in sel[0]:
                 self.handle_eth()
+
+            # Periodically send the replayed broadcast ARP requests to test for group key reinstallations
+            if time.time() > self.next_arp:
+                self.next_arp = time.time() + HANDSHAKE_TRANSMIT_INTERVAL
+                for client in self.clients.values():
+                    # Also keep injecting to PATCHED clients (just to be sure they keep rejecting replayed frames)
+                    if client.vuln_group != ClientState.VULNERABLE and client.mac in self.dhcp.leases:
+                        clientip = self.dhcp.leases[client.mac]
+                        log(INFO, "%s: sending broadcast ARP to %s from %s" % (client.mac, clientip, self.group_ip))
+
+                        request = Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(op=1, hwsrc=self.apmac, psrc=self.group_ip, pdst=clientip)
+                        self.sock_eth.send(request)
 
     def handle_mon (self):
         p = self.sock_mon.recv()
@@ -190,9 +215,18 @@ class DetectKRACK():
             client.check_pairwise_reinstall(p)
             client.track_used_iv(p)
 
-
     def handle_eth (self):
-        pass
+        p = self.sock_eth.recv()
+        if p == None or not Ether in p: return
+        self.process_eth_rx(p)
+
+    def process_eth_rx(self, p):
+        self.dhcp.reply(p)
+        self.group_arp.reply(p)
+
+        clientmac = p[Ether].src
+        if not clientmac in self.clients: return
+        client = self.clients[clientmac]
 
     def stop(self):
         log(STATUS, "Closing hostapd and cleaning up ...")
