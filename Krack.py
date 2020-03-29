@@ -1,211 +1,18 @@
 from scapy.all import *
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+from libwifi import *
+from wpaspy import Ctrl
 import os, stat, socket, select, atexit
 
-
-ALL, DEBUG, INFO, STATUS, WARNING, ERROR = range(6)
-global_log_level = INFO
 HANDSHAKE_TRANSMIT_INTERVAL = 2
-COLORCODES = {
-    "gray"  : "\033[0;37m",
-    "green" : "\033[0;32m",
-    "orange": "\033[0;33m",
-    "red"   : "\033[0;31m"
-}
 
-def log(level, msg, color=None, showtime=True):
-    if level < global_log_level: return
-    if level == DEBUG   and color is None: color="gray"
-    if level == WARNING and color is None: color="orange"
-    if level == ERROR   and color is None: color="red"
-    print (datetime.now().strftime('[%H:%M:%S] ') if showtime else " "*11) + COLORCODES.get(color, "") + msg + "\033[1;0m"
-
-
-counter = 0
-class Ctrl:
-    def __init__(self, path, port=9877):
-        global counter
-        self.started = False
-        self.attached = False
-        self.path = path
-        self.port = port
-
-        try:
-            mode = os.stat(path).st_mode
-            if stat.S_ISSOCK(mode):
-                self.udp = False
-            else:
-                self.udp = True
-        except:
-            self.udp = True
-
-        if not self.udp:
-            self.s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            self.dest = path
-            self.local = "/tmp/wpa_ctrl_" + str(os.getpid()) + '-' + str(counter)
-            counter += 1
-            self.s.bind(self.local)
-            try:
-                self.s.connect(self.dest)
-            except Exception, e:
-                self.s.close()
-                os.unlink(self.local)
-                raise
-        else:
-            try:
-                self.s = None
-                ai_list = socket.getaddrinfo(path, port, socket.AF_INET,
-                                             socket.SOCK_DGRAM)
-                for af, socktype, proto, cn, sockaddr in ai_list:
-                    self.sockaddr = sockaddr
-                    break
-                self.s = socket.socket(af, socktype)
-                self.s.settimeout(5)
-                self.s.sendto("GET_COOKIE", sockaddr)
-                reply, server = self.s.recvfrom(4096)
-                self.cookie = reply
-                self.port = port
-            except:
-                print "connect exception ", path, str(port)
-                if self.s != None:
-                    self.s.close()
-                raise
-        self.started = True
-
-    def __del__(self):
-        self.close()
-
-    def close(self):
-        if self.attached:
-            try:
-                self.detach()
-            except Exception, e:
-                # Need to ignore this allow the socket to be closed
-                self.attached = False
-                pass
-        if self.started:
-            self.s.close()
-            if not self.udp:
-                os.unlink(self.local)
-            self.started = False
-
-    def request(self, cmd, timeout=10):
-        if self.udp:
-            self.s.sendto(self.cookie + cmd, self.sockaddr)
-        else:
-            self.s.send(cmd)
-        [r, w, e] = select.select([self.s], [], [], timeout)
-        if r:
-            return self.s.recv(4096)
-        raise Exception("Timeout on waiting response")
-
-    def attach(self):
-        if self.attached:
-            return None
-        res = self.request("ATTACH")
-        if "OK" in res:
-            self.attached = True
-            return None
-        raise Exception("ATTACH failed")
-
-    def detach(self):
-        if not self.attached:
-            return None
-        while self.pending():
-            ev = self.recv()
-        res = self.request("DETACH")
-        if "FAIL" not in res:
-            self.attached = False
-            return None
-        raise Exception("DETACH failed")
-
-    def terminate(self):
-        if self.attached:
-            try:
-                self.detach()
-            except Exception, e:
-                # Need to ignore this to allow the socket to be closed
-                self.attached = False
-        self.request("TERMINATE")
-        self.close()
-
-    def pending(self, timeout=0):
-        [r, w, e] = select.select([self.s], [], [], timeout)
-        if r:
-            return True
-        return False
-
-    def recv(self):
-        res = self.s.recv(4096)
-        return res
-
-
-#### Packet Processing Functions ####
-
-class MitmSocket(L2Socket):
-    def __init__(self, **kwargs):
-        super(MitmSocket, self).__init__(**kwargs)
-
-    def send(self, p):
-        # Hack: set the More Data flag so we can detect injected frames (and so clients stay awake longer)
-        p[Dot11].FCfield |= 0x20
-        L2Socket.send(self, RadioTap()/p)
-
-    def _strip_fcs(self, p):
-        # Scapy can't handle the optional Frame Check Sequence (FCS) field automatically
-        if p[RadioTap].present & 2 != 0:
-            rawframe = str(p[RadioTap])
-            pos = 8
-            while ord(rawframe[pos - 1]) & 0x80 != 0: pos += 4
-
-            # If the TSFT field is present, it must be 8-bytes aligned
-            if p[RadioTap].present & 1 != 0:
-                pos += (8 - (pos % 8))
-                pos += 8
-
-            # Remove FCS if present
-            if ord(rawframe[pos]) & 0x10 != 0:
-                return Dot11(str(p[Dot11])[:-4])
-
-        return p[Dot11]
-
-    def recv(self, x=MTU):
-        p = L2Socket.recv(self, x)
-        if p == None or not Dot11 in p: return None
-
-        # Hack: ignore frames that we just injected and are echoed back by the kernel
-        if p[Dot11].FCfield & 0x20 != 0:
-            return None
-
-        # Strip the FCS if present, and drop the RadioTap header
-        return self._strip_fcs(p)
-
-    def close(self):
-        super(MitmSocket, self).close()
-
-
-class IvCollection():
-    def __init__(self):
-        self.ivs = dict() # maps IV values to IvInfo objects
-
-    def reset(self):
-        self.ivs = dict()
-
-    def track_used_iv(self, p):
-        iv = dot11_get_iv(p)
-        self.ivs[iv] = IvInfo(p)
-
-    def is_iv_reused(self, p):
-        """Returns True if this is an *observed* IV reuse and not just a retransmission"""
-        iv = dot11_get_iv(p)
-        return iv in self.ivs and self.ivs[iv].is_reused(p)
-
-    def is_new_iv(self, p):
-        """Returns True if the IV in this frame is higher than all previously observed ones"""
-        iv = dot11_get_iv(p)
-        if len(self.ivs) == 0: return True
-        return iv > max(self.ivs.keys())
+def hostapd_command(hostapd_ctrl, cmd):
+    rval = hostapd_ctrl.request(cmd)
+    if "UNKNOWN COMMAND" in rval:
+        log(ERROR, "Hostapd did not recognize the command %s. Did you (re)compile hostapd?" % cmd.split()[0])
+        quit(1)
+    return rval
 
 
 class ClientState():
@@ -220,7 +27,6 @@ class ClientState():
         self.ivs = IvCollection()
         self.pairkey_sent_time_prev_iv = None
         self.pairkey_intervals_no_iv_reuse = 0
-        self.pairkey_tptk = test_tptk
 
     def get_encryption_key(self, hostapd_ctrl):
         if self.TK is None:
@@ -286,15 +92,8 @@ class ClientState():
             if self.pairkey_intervals_no_iv_reuse >= 5 and self.vuln_4way == ClientState.UNKNOWN:
                 self.vuln_4way = ClientState.PATCHED
 
-                # Be sure to clarify *which* type of attack failed (to remind user to test others attacks as well)
-                msg = "%s: client DOESN'T seem vulnerable to pairwise key reinstallation in the 4-way handshake"
-                if self.pairkey_tptk == KRAckAttackClient.TPTK_NONE:
-                    msg += " (using standard attack)"
-                elif self.pairkey_tptk == KRAckAttackClient.TPTK_REPLAY:
-                    msg += " (using TPTK attack)"
-                elif self.pairkey_tptk == KRAckAttackClient.TPTK_RAND:
-                    msg += " (using TPTK-RAND attack)"
-                log(INFO, (msg + ".") % self.mac, color="green")
+                msg = "Client DOESN'T seem vulnerable to pairwise key reinstallation in the 4-way handshake using standard attack."
+                log(INFO, msg, color="green")
 
     def mark_allzero_key(self, p):
         if self.vuln_4way != ClientState.VULNERABLE:
@@ -354,18 +153,6 @@ class DetectKRACK():
         self.sock_mon = MitmSocket(type=ETH_P_ALL, iface=self.nic_mon)
         self.sock_eth = L2Socket(type=ETH_P_ALL, iface=self.nic_iface)
 
-        """self.dhcp = DHCP_sock(sock=self.sock_eth,
-                        domain='krackattack.com',
-                        pool=Net('192.168.100.0/24'),
-                        network='192.168.100.0/24',
-                        gw='192.168.100.254',
-                        renewal_time=600, lease_time=3600)
-        # Configure gateway IP: reply to ARP and ping requests
-        subprocess.check_output(["ifconfig", self.nic_iface, "192.168.100.254"])
-
-        self.group_ip = self.dhcp.pool.pop()
-        self.group_arp = ARP_sock(sock=self.sock_eth, IP_addr=self.group_ip, ARP_addr=self.apmac)"""
-
         log(STATUS, "Ready. Connect to this Access Point to start the tests.", color="green")
 
         # Monitor both the normal interface and virtual monitor interface of the AP
@@ -376,19 +163,6 @@ class DetectKRACK():
                 self.handle_mon()
             if self.sock_eth in sel[0]:
                 self.handle_eth()
-
-            # Periodically send the replayed broadcast ARP requests to test for group key reinstallations
-            """if time.time() > self.next_arp:
-                self.next_arp = time.time() + HANDSHAKE_TRANSMIT_INTERVAL
-                for client in self.clients.values():
-                    # Also keep injecting to PATCHED clients (just to be sure they keep rejecting replayed frames)
-                    if client.vuln_group != ClientState.VULNERABLE and client.mac in self.dhcp.leases:
-                        clientip = self.dhcp.leases[client.mac]
-                        client.groupkey_track_request()
-                        log(INFO, "%s: sending broadcast ARP to %s from %s" % (client.mac, clientip, self.group_ip))
-
-                        request = Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(op=1, hwsrc=self.apmac, psrc=self.group_ip, pdst=clientip)
-                        self.sock_eth.send(request)"""
 
     def handle_mon (self):
         p = self.sock_mon.recv()
@@ -414,8 +188,6 @@ class DetectKRACK():
             if decrypt_ccmp(p, "\x00" * 16).startswith("\xAA\xAA\x03\x00\x00\x00"):
                 client.mark_allzero_key(p)
             client.check_pairwise_reinstall(p)
-            if client.is_iv_reused(p):
-                self.handle_replay(p)
             client.track_used_iv(p)
 
 
