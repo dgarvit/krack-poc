@@ -185,6 +185,127 @@ class MitmSocket(L2Socket):
         super(MitmSocket, self).close()
 
 
+class IvCollection():
+    def __init__(self):
+        self.ivs = dict() # maps IV values to IvInfo objects
+
+    def reset(self):
+        self.ivs = dict()
+
+    def track_used_iv(self, p):
+        iv = dot11_get_iv(p)
+        self.ivs[iv] = IvInfo(p)
+
+    def is_iv_reused(self, p):
+        """Returns True if this is an *observed* IV reuse and not just a retransmission"""
+        iv = dot11_get_iv(p)
+        return iv in self.ivs and self.ivs[iv].is_reused(p)
+
+    def is_new_iv(self, p):
+        """Returns True if the IV in this frame is higher than all previously observed ones"""
+        iv = dot11_get_iv(p)
+        if len(self.ivs) == 0: return True
+        return iv > max(self.ivs.keys())
+
+
+class ClientState():
+    UNKNOWN, VULNERABLE, PATCHED = range(3)
+    IDLE, STARTED, GOT_CANARY, FINISHED = range(4)
+
+    def __init__(self, clientmac):
+        self.mac = clientmac
+        self.TK = None
+        self.vuln_4way = ClientState.UNKNOWN
+
+        self.ivs = IvCollection()
+        self.pairkey_sent_time_prev_iv = None
+        self.pairkey_intervals_no_iv_reuse = 0
+        self.pairkey_tptk = test_tptk
+
+    def get_encryption_key(self, hostapd_ctrl):
+        if self.TK is None:
+            # Clear old replies and messages from the hostapd control interface
+            while hostapd_ctrl.pending():
+                hostapd_ctrl.recv()
+            # Contact our modified Hostapd instance to request the pairwise key
+            response = hostapd_command(hostapd_ctrl, "GET_TK " + self.mac)
+            if not "FAIL" in response:
+                self.TK = response.strip().decode("hex")
+        return self.TK
+
+    def decrypt(self, p, hostapd_ctrl):
+        payload = get_ccmp_payload(p)
+        llcsnap, packet = payload[:8], payload[8:]
+
+        if payload.startswith("\xAA\xAA\x03\x00\x00\x00"):
+            # On some kernels, the virtual interface associated to the real AP interface will return
+            # frames where the payload is already decrypted (this happens when hardware decryption is
+            # used). So if the payload seems decrypted, just extract the full plaintext from the frame.
+            plaintext = payload
+        else:
+            key       = self.get_encryption_key(hostapd_ctrl)
+            plaintext = decrypt_ccmp(p, key)
+
+            # If it still fails, try an all-zero key
+            if not plaintext.startswith("\xAA\xAA\x03\x00\x00\x00"):
+                plaintext = decrypt_ccmp(p, "\x00" * 16)
+
+        return plaintext
+
+    def track_used_iv(self, p):
+        return self.ivs.track_used_iv(p)
+
+    def is_iv_reused(self, p):
+        return self.ivs.is_iv_reused(p)
+
+    def check_pairwise_reinstall(self, p):
+        """Inspect whether the IV is reused, or whether the client seem to be patched"""
+
+        # If this is gaurenteed IV reuse (and not just a benign retransmission), mark the client as vulnerable
+        if self.ivs.is_iv_reused(p):
+            if self.vuln_4way != ClientState.VULNERABLE:
+                iv = dot11_get_iv(p)
+                seq = dot11_get_seqnum(p)
+                log(INFO, ("%s: IV reuse detected (IV=%d, seq=%d). " +
+                    "Client is vulnerable to pairwise key reinstallations in the 4-way handshake!") % (self.mac, iv, seq), color="green")
+            self.vuln_4way = ClientState.VULNERABLE
+
+        # If it's a higher IV than all previous ones, try to check if the client seems patched
+        elif self.vuln_4way == ClientState.UNKNOWN and self.ivs.is_new_iv(p):
+            # Save how many intervals we received a data packet without IV reset. Use twice the
+            # transmission interval of message 3, in case one message 3 is lost due to noise.
+            if self.pairkey_sent_time_prev_iv is None:
+                self.pairkey_sent_time_prev_iv = p.time
+            elif self.pairkey_sent_time_prev_iv + 2 * HANDSHAKE_TRANSMIT_INTERVAL + 1 <= p.time:
+                self.pairkey_intervals_no_iv_reuse += 1
+                self.pairkey_sent_time_prev_iv = p.time
+                log(DEBUG, "%s: no pairwise IV resets seem to have occured for one interval" % self.mac)
+
+            # If during several intervals all IV reset attempts failed, the client is likely patched.
+            # We wait for enough such intervals to occur, to avoid getting a wrong result.
+            if self.pairkey_intervals_no_iv_reuse >= 5 and self.vuln_4way == ClientState.UNKNOWN:
+                self.vuln_4way = ClientState.PATCHED
+
+                # Be sure to clarify *which* type of attack failed (to remind user to test others attacks as well)
+                msg = "%s: client DOESN'T seem vulnerable to pairwise key reinstallation in the 4-way handshake"
+                if self.pairkey_tptk == KRAckAttackClient.TPTK_NONE:
+                    msg += " (using standard attack)"
+                elif self.pairkey_tptk == KRAckAttackClient.TPTK_REPLAY:
+                    msg += " (using TPTK attack)"
+                elif self.pairkey_tptk == KRAckAttackClient.TPTK_RAND:
+                    msg += " (using TPTK-RAND attack)"
+                log(INFO, (msg + ".") % self.mac, color="green")
+
+    def mark_allzero_key(self, p):
+        if self.vuln_4way != ClientState.VULNERABLE:
+            iv = dot11_get_iv(p)
+            seq = dot11_get_seqnum(p)
+            log(INFO, ("%s: usage of all-zero key detected (IV=%d, seq=%d). " +
+                "Client is vulnerable to (re)installation of an all-zero key in the 4-way handshake!") % (self.mac, iv, seq), color="green")
+            log(WARNING, "%s: !!! Other tests are unreliable due to all-zero key usage, please fix this first !!!" % self.mac)
+        self.vuln_4way = ClientState.VULNERABLE
+
+
 class DetectKRACK():
     def __init__ (self):
         self.script_path = os.path.dirname(os.path.realpath(__file__))
@@ -284,6 +405,18 @@ class DetectKRACK():
 
         elif p.addr1 == self.apmac and Dot11WEP in p:
             if not clientmac in self.clients:
+                self.clients[clientmac] = ClientState(clientmac)
+            client = self.clients[clientmac]
+
+            iv = dot11_get_iv(p)
+            log(DEBUG, "%s: transmitted data using IV=%d (seq=%d)" % (clientmac, iv, dot11_get_seqnum(p)))
+
+            if decrypt_ccmp(p, "\x00" * 16).startswith("\xAA\xAA\x03\x00\x00\x00"):
+                client.mark_allzero_key(p)
+            client.check_pairwise_reinstall(p)
+            if client.is_iv_reused(p):
+                self.handle_replay(p)
+            client.track_used_iv(p)
 
 
     def handle_eth (self):
